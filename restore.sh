@@ -43,33 +43,31 @@ fi
 echo "Starting restore..."
 zstd -d < "$BACKUP_PATH" | sudo partclone.dd -s - -o "$DISK"
 
+sudo umount "$MOUNTPOINT"
+
 ## The following is all untested bs
 ## Just trying to repair fstab, rebuild initramfs, and grub because the uuids have probably changed
 
-PART_ROOT=$(lsblk -lnpo NAME "$DISK" | tail -n1)
-sudo mount "$PART_ROOT" /mnt
+echo "Attempting to unlock restored disk ..."
+LUKS_PART=$(lsblk -lnpo NAME,FSTYPE "$DISK" | awk '$2=="crypto_LUKS"{print $1; exit}')
+if [ -n "$LUKS_PART" ]; then
+    sudo cryptsetup luksOpen "$LUKS_PART" cryptroot
+    sudo vgscan
+    sudo vgchange -ay
 
-for dir in /dev /proc /sys /run; do sudo mount --bind $dir /mnt$dir; done
-sudo chroot /mnt bash -c '
-> /etc/fstab
-for part in $(lsblk -lnpo NAME,UUID,FSTYPE,MOUNTPOINT | grep -E "ext4|btrfs|xfs"); do
-    dev=$(echo $part | awk "{print \$1}")
-    uuid=$(echo $part | awk "{print \$2}")
-    fstype=$(echo $part | awk "{print \$3}")
-    mountpoint=$(echo $part | awk "{print \$4}")
-    [ -n "$mountpoint" ] && echo "UUID=$uuid $mountpoint $fstype defaults 0 1" >> /etc/fstab
-done
-mount -a || true
-dracut --force
-if [ -d /sys/firmware/efi ]; then
-    grub2-mkconfig -o /boot/efi/EFI/fedora/grub.cfg
+    ROOT_LV=$(lsblk -lnpo NAME,FSTYPE | awk '$2=="btrfs"{print $1; exit}')
+    if [ -n "$ROOT_LV" ]; then
+        sudo mkdir -p /mnt/restored
+        sudo mount -o subvolid=5 "$ROOT_LV" /mnt/restored
+        SUBVOL=$(btrfs subvolume list /mnt/restored | awk '/ path @($|\/)/{print $9; exit}')
+        [ -z "$SUBVOL" ] && SUBVOL=$(btrfs subvolume list /mnt/restored | awk 'NR==1{print $9}')
+        sudo umount /mnt/restored
+        sudo mount -o subvol="$SUBVOL" "$ROOT_LV" /mnt/restored
+        echo "Restored system mounted at /mnt/restored"
+        echo "Next steps: bind-mount /dev,/proc,/sys,/run and chroot to regenerate fstab/initramfs/grub"
+    else
+        echo "No Btrfs LV found after restore."
+    fi
 else
-    grub2-mkconfig -o /boot/grub2/grub.cfg
+    echo "No LUKS partition detected — restore may be plain ext4/Btrfs."
 fi
-'
-for dir in /dev /proc /sys /run; do sudo umount /mnt$dir; done
-sudo umount /mnt
-sudo umount "$MOUNTPOINT"
-
-echo "Done."
-
